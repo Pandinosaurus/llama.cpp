@@ -10,8 +10,11 @@ file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR})
 
 message(STATUS "Shader output dir: ${SHADER_OUTPUT_DIR}")
 
-# Find all WGSL files
-file(GLOB WGSL_SHADER_FILES "${SHADER_DIR}/*.wgsl")
+# Find all WGSL sources
+file(GLOB WGSL_SHADER_FILES
+    "${SHADER_DIR}/*.wgsl"
+    "${SHADER_DIR}/*.tmpl"
+)
 
 # Generate the header using a Python script
 add_custom_command(
@@ -36,11 +39,32 @@ ggml_add_backend_library(ggml-webgpu
 
 add_dependencies(ggml-webgpu generate_shaders)
 
+# Dawn needs C++20 (https://dawn.googlesource.com/dawn/+/refs/heads/main/docs/quickstart-cmake.md#prerequisites)
+target_compile_features(ggml-webgpu PRIVATE cxx_std_20)
+
+# Disable C++20 module scanning since emscan-deps fails to find webgpu_cpp.h
+set_target_properties(ggml-webgpu PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+
 if(EMSCRIPTEN)
     set(EMDAWNWEBGPU_DIR "" CACHE PATH "Path to emdawnwebgpu_pkg")
 
-    target_compile_options(ggml-webgpu PRIVATE "--use-port=${EMDAWNWEBGPU_DIR}/emdawnwebgpu.port.py")
-    target_link_options(ggml-webgpu PRIVATE "--use-port=${EMDAWNWEBGPU_DIR}/emdawnwebgpu.port.py")
+    if(NOT EMDAWNWEBGPU_DIR)
+        # default built-in port
+        target_compile_options(ggml-webgpu PRIVATE "--use-port=emdawnwebgpu")
+        target_link_options(ggml-webgpu INTERFACE "--use-port=emdawnwebgpu")
+    else()
+        # custom port
+        target_compile_options(ggml-webgpu PRIVATE "--use-port=${EMDAWNWEBGPU_DIR}/emdawnwebgpu.port.py")
+        target_link_options(ggml-webgpu INTERFACE "--use-port=${EMDAWNWEBGPU_DIR}/emdawnwebgpu.port.py")
+    endif()
+
+    if (GGML_WEBGPU_JSPI)
+        target_compile_options(ggml-webgpu PRIVATE "-fwasm-exceptions")
+        target_link_options(ggml-webgpu INTERFACE "-sJSPI" "-fwasm-exceptions")
+    else()
+        target_compile_options(ggml-webgpu PRIVATE "-fexceptions")
+        target_link_options(ggml-webgpu INTERFACE "-sASYNCIFY" "-exceptions")
+    endif()
 else()
     find_package(Dawn REQUIRED)
     set(DawnWebGPU_TARGET dawn::webgpu_dawn)
@@ -48,6 +72,9 @@ endif()
 
 if (GGML_WEBGPU_DEBUG)
     target_compile_definitions(ggml-webgpu PRIVATE GGML_WEBGPU_DEBUG=1)
+    if(EMSCRIPTEN)
+        target_link_options(ggml-webgpu INTERFACE "-sASSERTIONS=2")
+    endif()
 endif()
 
 if (GGML_WEBGPU_CPU_PROFILE)

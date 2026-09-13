@@ -3,6 +3,7 @@
   glibc,
   config,
   stdenv,
+  stdenvNoCC,
   runCommand,
   cmake,
   ninja,
@@ -16,8 +17,11 @@
   rocmPackages,
   vulkan-headers,
   vulkan-loader,
-  curl,
+  openssl,
   shaderc,
+  spirv-headers,
+  nodejs,
+  importNpmLock,
   useBlas ?
     builtins.all (x: !x) [
       useCuda
@@ -27,13 +31,13 @@
     ]
     && blas.meta.available,
   useCuda ? config.cudaSupport,
-  useMetalKit ? stdenv.isAarch64 && stdenv.isDarwin,
+  useMetalKit ? stdenv.hostPlatform.isAarch64 && stdenv.hostPlatform.isDarwin,
   # Increases the runtime closure size by ~700M
   useMpi ? false,
   useRocm ? config.rocmSupport,
   rocmGpuTargets ? builtins.concatStringsSep ";" rocmPackages.clr.gpuTargets,
-  enableCurl ? true,
   useVulkan ? false,
+  useRpc ? false,
   llamaVersion ? "0.0.0", # Arbitrary version, substituted by the flake
 
   # It's necessary to consistently use backendStdenv when building with CUDA support,
@@ -41,6 +45,7 @@
   effectiveStdenv ? if useCuda then cudaPackages.backendStdenv else stdenv,
   enableStatic ? effectiveStdenv.hostPlatform.isStatic,
   precompileMetalShaders ? false,
+  useWebUi ? true,
 }:
 
 let
@@ -87,7 +92,7 @@ let
 
   cudaBuildInputs = with cudaPackages; [
     cuda_cudart
-    cuda_cccl # <nv/target>
+    cccl # <nv/target>
     libcublas
   ];
 
@@ -101,6 +106,7 @@ let
     vulkan-headers
     vulkan-loader
     shaderc
+    spirv-headers
   ];
 in
 
@@ -127,7 +133,31 @@ effectiveStdenv.mkDerivation (finalAttrs: {
     src = lib.cleanSource ../../.;
   };
 
-  postPatch = ''
+  # Builds the webui locally, taking care not to require updating any sha256 hash.
+  webui = stdenvNoCC.mkDerivation {
+    pname = "webui";
+    version = llamaVersion;
+    src = lib.cleanSource ../../tools/ui;
+
+    nativeBuildInputs = [
+      nodejs
+      importNpmLock.linkNodeModulesHook
+    ];
+
+    # no sha256 required when using buildNodeModules
+    npmDeps = importNpmLock.buildNodeModules {
+      npmRoot = ../../tools/ui;
+      inherit nodejs;
+    };
+
+    installPhase = ''
+      LLAMA_UI_OUT_DIR=$out npm run build --offline
+    '';
+  };
+
+  postPatch = lib.optionalString useWebUi ''
+    cp -r ${finalAttrs.webui} tools/ui/dist
+    chmod -R u+w tools/ui/dist
   '';
 
   # With PR#6015 https://github.com/ggml-org/llama.cpp/pull/6015,
@@ -136,7 +166,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
   # `xcrun` is used find the path of the Metal compiler, which is varible
   # and not on $PATH
   # see https://github.com/ggml-org/llama.cpp/pull/6118 for discussion
-  __noChroot = effectiveStdenv.isDarwin && useMetalKit && precompileMetalShaders;
+  __noChroot = effectiveStdenv.hostPlatform.isDarwin && useMetalKit && precompileMetalShaders;
 
   nativeBuildInputs =
     [
@@ -151,23 +181,23 @@ effectiveStdenv.mkDerivation (finalAttrs: {
       autoAddDriverRunpath
     ]
     ++ optionals (effectiveStdenv.hostPlatform.isGnu && enableStatic) [ glibc.static ]
-    ++ optionals (effectiveStdenv.isDarwin && useMetalKit && precompileMetalShaders) [ xcrunHost ];
+    ++ optionals (effectiveStdenv.hostPlatform.isDarwin && useMetalKit && precompileMetalShaders) [ xcrunHost ];
 
   buildInputs =
-    optionals effectiveStdenv.isDarwin darwinBuildInputs
+    optionals effectiveStdenv.hostPlatform.isDarwin darwinBuildInputs
     ++ optionals useCuda cudaBuildInputs
     ++ optionals useMpi [ mpi ]
     ++ optionals useRocm rocmBuildInputs
     ++ optionals useBlas [ blas ]
     ++ optionals useVulkan vulkanBuildInputs
-    ++ optionals enableCurl [ curl ];
+    ++ [ openssl ];
 
   cmakeFlags =
     [
       (cmakeBool "LLAMA_BUILD_SERVER" true)
+      (cmakeBool "LLAMA_BUILD_WEBUI" useWebUi)
       (cmakeBool "BUILD_SHARED_LIBS" (!enableStatic))
       (cmakeBool "CMAKE_SKIP_BUILD_RPATH" true)
-      (cmakeBool "LLAMA_CURL" enableCurl)
       (cmakeBool "GGML_NATIVE" false)
       (cmakeBool "GGML_BLAS" useBlas)
       (cmakeBool "GGML_CUDA" useCuda)
@@ -175,6 +205,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
       (cmakeBool "GGML_METAL" useMetalKit)
       (cmakeBool "GGML_VULKAN" useVulkan)
       (cmakeBool "GGML_STATIC" enableStatic)
+      (cmakeBool "GGML_RPC" useRpc)
     ]
     ++ optionals useCuda [
       (
@@ -214,7 +245,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
 
     # Configurations that are known to result in build failures. Can be
     # overridden by importing Nixpkgs with `allowBroken = true`.
-    broken = (useMetalKit && !effectiveStdenv.isDarwin);
+    broken = (useMetalKit && !effectiveStdenv.hostPlatform.isDarwin);
 
     description = "Inference of LLaMA model in pure C/C++${descriptionSuffix}";
     homepage = "https://github.com/ggml-org/llama.cpp/";
